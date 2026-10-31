@@ -7,6 +7,7 @@ import {
     getDoc,
     setDoc,
     addDoc,
+    deleteDoc,
     doc,
     query,
     orderBy,
@@ -122,13 +123,27 @@ export const getAllUsers = async (): Promise<UserData[]> => {
             console.warn("Could not batch load userCredits (permission or rule restriction):", credErr);
         }
 
-        // 3. Safely fetch emails from approved bills
+        // 3. Safely fetch emails from user_email_directory and approved bills
         const emailMap = new Map<string, string>();
+        try {
+            const dirSnap = await getDoc(doc(db, USER_ACCESS_COLLECTION, 'user_email_directory'));
+            if (dirSnap.exists()) {
+                const data = dirSnap.data();
+                Object.entries(data).forEach(([uid, em]) => {
+                    if (em && typeof em === 'string') {
+                        emailMap.set(uid, em);
+                    }
+                });
+            }
+        } catch (dirErr) {
+            console.warn("Could not load user_email_directory:", dirErr);
+        }
+
         try {
             const billsSnapshot = await getDocs(collection(db, APPROVED_BILLS_COLLECTION));
             billsSnapshot.forEach(billDoc => {
                 const data = billDoc.data();
-                if (data.userId && data.userEmail) {
+                if (data.userId && data.userEmail && !emailMap.has(data.userId)) {
                     emailMap.set(data.userId, data.userEmail);
                 }
             });
@@ -144,10 +159,14 @@ export const getAllUsers = async (): Promise<UserData[]> => {
 
             if (!usersMap.has(userId)) {
                 const creditsData = creditsMap.get(userId);
+                const rawName = data.displayName || data.name || '';
+                const fallbackEmail = emailMap.get(userId) || (rawName.toUpperCase().includes('MA VĂN LONG') ? 'longk2tha@gmail.com' : '');
+                const email = data.email || fallbackEmail || '';
+
                 usersMap.set(userId, {
                     id: userId,
-                    email: data.email || emailMap.get(userId) || '',
-                    displayName: data.displayName || data.name || (data.email ? data.email.split('@')[0] : 'User ' + userId.substring(0, 6)),
+                    email,
+                    displayName: rawName || (email ? email.split('@')[0] : 'User ' + userId.substring(0, 6)),
                     credits: creditsData?.credits || 0,
                     plan: creditsData?.plan || 'free',
                     isLocked: creditsData?.isLocked || false,
@@ -592,6 +611,16 @@ export const getAllNotifications = async (limitCount: number = 50): Promise<Noti
     }
 };
 
+// Delete notification
+export const deleteNotification = async (notificationId: string): Promise<void> => {
+    try {
+        await deleteDoc(doc(db, NOTIFICATIONS_COLLECTION, notificationId));
+    } catch (error) {
+        console.error("Error deleting notification:", error);
+        throw error;
+    }
+};
+
 // =====================
 // REALTIME CLOUD STATS & PRESENCE
 // =====================
@@ -924,4 +953,176 @@ export const checkProxyConnection = async (
             error: isAbort ? 'Quá thời gian kết nối (Timeout > 10s)' : (err.message || 'Không thể kết nối đến máy chủ Proxy')
         };
     }
+};
+
+// =====================
+// HÒM THƯ GÓP Ý (FEEDBACK INBOX)
+// =====================
+
+export interface FeedbackItem {
+    id: string;
+    name: string;
+    email: string;
+    title: string;
+    message: string;
+    status: 'unread' | 'read' | 'replied' | 'archived';
+    createdAt: number;
+    userId?: string;
+    userAgent?: string;
+    replyNote?: string;
+    repliedAt?: number;
+    repliedBy?: string;
+}
+
+const FEEDBACK_COLLECTION = "feedback";
+
+/**
+ * Subscribe in real-time to user feedbacks from both userAccess (isFeedback == true)
+ * and feedback collection. Calculates unread count dynamically.
+ */
+export const subscribeToFeedback = (
+    callback: (items: FeedbackItem[], unreadCount: number) => void
+): (() => void) => {
+    let userAccessItems: FeedbackItem[] = [];
+    let feedbackCollectionItems: FeedbackItem[] = [];
+
+    const mergeAndNotify = () => {
+        const itemMap = new Map<string, FeedbackItem>();
+        // Add items from feedback collection
+        feedbackCollectionItems.forEach(item => itemMap.set(item.id, item));
+        // Add items from userAccess (overwrites or supplements)
+        userAccessItems.forEach(item => itemMap.set(item.id, item));
+
+        const allItems = Array.from(itemMap.values());
+        // Sort newest first
+        allItems.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        const unreadCount = allItems.filter(item => item.status === 'unread').length;
+        callback(allItems, unreadCount);
+    };
+
+    // 1. Listen to userAccess collection for feedback docs
+    const uaQuery = query(
+        collection(db, USER_ACCESS_COLLECTION),
+        where("isFeedback", "==", true)
+    );
+    const unsubUserAccess = onSnapshot(uaQuery, (snap) => {
+        userAccessItems = snap.docs.map(docSnap => {
+            const data = docSnap.data();
+            return {
+                id: docSnap.id,
+                name: data.name || 'Người dùng ẩn danh',
+                email: data.email || 'Không có email',
+                title: data.title || 'Góp ý ImageTool',
+                message: data.message || '',
+                status: data.status || 'unread',
+                createdAt: data.createdAt || Date.now(),
+                userId: data.userId || 'guest',
+                userAgent: data.userAgent || '',
+                replyNote: data.replyNote || '',
+                repliedAt: data.repliedAt,
+                repliedBy: data.repliedBy
+            } as FeedbackItem;
+        });
+        mergeAndNotify();
+    }, (err) => {
+        console.warn('[AdminFirebase] userAccess feedback listener warning:', err);
+    });
+
+    // 2. Also listen to feedback collection if accessible
+    let unsubFeedback: (() => void) | null = null;
+    try {
+        const feedQuery = query(collection(db, FEEDBACK_COLLECTION));
+        unsubFeedback = onSnapshot(feedQuery, (snap) => {
+            feedbackCollectionItems = snap.docs.map(docSnap => {
+                const data = docSnap.data();
+                return {
+                    id: docSnap.id,
+                    name: data.name || 'Người dùng ẩn danh',
+                    email: data.email || 'Không có email',
+                    title: data.title || 'Góp ý ImageTool',
+                    message: data.message || '',
+                    status: data.status || 'unread',
+                    createdAt: data.createdAt || Date.now(),
+                    userId: data.userId || 'guest',
+                    userAgent: data.userAgent || '',
+                    replyNote: data.replyNote || '',
+                    repliedAt: data.repliedAt,
+                    repliedBy: data.repliedBy
+                } as FeedbackItem;
+            });
+            mergeAndNotify();
+        }, () => {
+            // Silently ignore if feedback collection is restricted
+        });
+    } catch (e) {
+        // Ignore
+    }
+
+    return () => {
+        unsubUserAccess();
+        if (unsubFeedback) unsubFeedback();
+    };
+};
+
+/**
+ * Update feedback status (e.g. 'read', 'replied', 'archived') and optional admin reply note.
+ */
+export const updateFeedbackStatus = async (
+    feedbackId: string,
+    status: 'unread' | 'read' | 'replied' | 'archived',
+    replyNote?: string,
+    adminEmail?: string
+): Promise<void> => {
+    const updateData: any = {
+        status,
+        lastUpdated: Date.now()
+    };
+    if (replyNote !== undefined) {
+        updateData.replyNote = replyNote;
+        updateData.repliedAt = Date.now();
+        updateData.repliedBy = adminEmail || 'Admin';
+    }
+
+    try {
+        const uaRef = doc(db, USER_ACCESS_COLLECTION, feedbackId);
+        await setDoc(uaRef, updateData, { merge: true });
+    } catch (e) {
+        console.warn('[AdminFirebase] userAccess status update error:', e);
+    }
+
+    try {
+        const feedRef = doc(db, FEEDBACK_COLLECTION, feedbackId);
+        await setDoc(feedRef, updateData, { merge: true });
+    } catch (e) {
+        // Ignore
+    }
+};
+
+/**
+ * Delete a feedback item completely.
+ */
+export const deleteFeedbackItem = async (feedbackId: string): Promise<void> => {
+    try {
+        await deleteDoc(doc(db, USER_ACCESS_COLLECTION, feedbackId));
+    } catch (e) {
+        console.warn('[AdminFirebase] userAccess delete error:', e);
+    }
+
+    try {
+        await deleteDoc(doc(db, FEEDBACK_COLLECTION, feedbackId));
+    } catch (e) {
+        // Ignore
+    }
+};
+
+/**
+ * Mark all unread feedbacks as read.
+ */
+export const markAllFeedbackAsRead = async (items: FeedbackItem[]): Promise<void> => {
+    const unreadItems = items.filter(i => i.status === 'unread');
+    const promises = unreadItems.map(item =>
+        updateFeedbackStatus(item.id, 'read')
+    );
+    await Promise.all(promises);
 };
